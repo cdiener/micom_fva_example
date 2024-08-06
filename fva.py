@@ -1,6 +1,9 @@
 from cobra.flux_analysis import flux_variability_analysis
 from cobra.util import OptimizationError
+from cobra.io import load_json_model
 from micom import load_pickle
+from micom.db import load_zip_model_db, load_manifest
+from micom.qiime_formats import load_qiime_model_db
 from micom.logger import logger
 from micom.media import minimal_medium
 from micom.util import _apply_min_growth
@@ -8,6 +11,7 @@ from micom.workflows import workflow
 from micom.workflows.media import process_medium
 import pandas as pd
 from os import path
+from tempfile import TemporaryDirectory
 
 def fva_worker(args):
     """Perform FVA for a set of taxa in a single model.
@@ -97,7 +101,7 @@ def fva_worker(args):
     return fva
 
 
-def eFVA(
+def ceFVA(
     manifest,
     model_folder,
     medium,
@@ -108,7 +112,7 @@ def eFVA(
     fva_threshold=0.95,
     threads=1
 ):
-    """Perform an exchange FVA for a list of models.
+    """Perform a community exchange FVA for a list of models.
 
     This will perform flux variability analysis for a set of metabolite exchnages in
     one or several taxa. Note that the run time will scale with n_mets * n_taxa so running
@@ -180,3 +184,95 @@ def eFVA(
     results = pd.concat(r for r in results if r is not None).reset_index(drop=True)
 
     return results
+
+
+def taxon_worker(args):
+    p, medium, rxns, thresh, sid = args
+    model = load_json_model(p)
+
+    medium.index = medium.reaction
+    model.medium = medium.flux.abs()
+    if rxns is None:
+        rs = model.exchanges
+    else:
+        rs = [r for r in model.reactions if r.id in set(rxns)]
+    if len(rs) == 0:
+        return None
+
+    fva = flux_variability_analysis(
+        model,
+        rs,
+        fraction_of_optimum=thresh,
+        processes=1
+    )
+    fva["reaction"] = fva.index
+    fva["sample_id"] = sid
+    return fva.reset_index(drop=True)
+
+
+def eFVA(
+    results,
+    model_db,
+    taxa,
+    reactions = None,
+    fva_threshold=0.95,
+    threads=1
+):
+    """Run exchange FVA on taxon models constrained by a reference solution.
+
+    This does not require community models. It will take a MICOM reference solution and
+    assume that the individual taxon uptakes are limited to the ones in that solution.
+    After fixing those a "conventional" FVA is run on the taxon with this medium.
+
+
+    Arguments
+    ---------
+    results : GrowthResults
+        A reference result from which to get exchange bounds for individual taxa.
+    model_db : str
+        Path to the model database used to generate the results.
+    taxa : list of str
+        A list of taxa to run the FVA on.
+    threads : int >0
+        The number of threads to use.
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+    compressed = model_db.endswith(".qza") or model_db.endswith(".zip")
+    if compressed:
+        tdir = TemporaryDirectory(prefix="micom_")
+    if model_db.endswith(".qza"):
+        manifest = load_qiime_model_db(model_db, tdir.name)
+    elif model_db.endswith(".zip"):
+        manifest = load_zip_model_db(model_db, tdir.name)
+    else:
+        manifest = load_manifest(model_db)
+
+    media = results.exchanges[results.exchanges.taxon.isin(taxa)]
+    media = media[media.direction == "import"].loc[
+        :, ["taxon", "reaction", "sample_id", "flux"]]
+
+    runs = media[["taxon", "sample_id"]].drop_duplicates()
+    args = [
+        (
+            path.join(tdir.name, manifest[manifest.id == t].file.iloc[0]),
+            media[(media.sample_id == s) & (media.taxon == t)],
+            reactions,
+            fva_threshold,
+            s
+        )
+        for t, s in runs.values
+    ]
+    fva = workflow(taxon_worker, args, threads, progress=True)
+    if all([r is None for r in fva]):
+        raise OptimizationError(
+            "All numerical optimizations failed. This indicates a problem "
+            "with the solver or numerical instabilities. Check that you have "
+            "CPLEX or Gurobi installed. You may also increase the abundance "
+            "cutoff to create simpler models."
+        )
+    fva = pd.concat(r for r in fva if r is not None).reset_index(drop=True)
+    fva = fva.merge(results.annotations, on="reaction", how="left")
+    return fva
